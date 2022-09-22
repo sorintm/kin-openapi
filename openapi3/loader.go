@@ -696,7 +696,7 @@ func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPat
 			}
 			component.Value = &schema
 		} else {
-			if visitedLimit(visited, ref, 3) {
+			if visitedLimit(visited, ref, 100) {
 				visited = append(visited, ref)
 				return fmt.Errorf("%s - %s", CircularReferenceError, strings.Join(visited, " -> "))
 			}
