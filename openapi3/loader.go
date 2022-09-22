@@ -15,6 +15,8 @@ import (
 	"github.com/invopop/yaml"
 )
 
+var CircularReferenceError = "kin-openapi bug found: circular schema reference not handled"
+
 func foundUnresolvedRef(ref string) error {
 	return fmt.Errorf("found unresolved ref: %q", ref)
 }
@@ -101,7 +103,7 @@ func (loader *Loader) loadSingleElementFromURI(ref string, rootPath *url.URL, el
 
 	resolvedPath, err := resolvePath(rootPath, parsedURL)
 	if err != nil {
-		return nil, fmt.Errorf("could not resolve path: %v", err)
+		return nil, fmt.Errorf("could not resolve path: %w", err)
 	}
 
 	data, err := loader.readURL(resolvedPath)
@@ -197,7 +199,7 @@ func (loader *Loader) ResolveRefsIn(doc *T, location *url.URL) (err error) {
 		}
 	}
 	for _, component := range components.Schemas {
-		if err = loader.resolveSchemaRef(doc, component, location); err != nil {
+		if err = loader.resolveSchemaRef(doc, component, location, []string{}); err != nil {
 			return
 		}
 	}
@@ -285,7 +287,7 @@ func (loader *Loader) resolveComponent(
 
 			if cursor, err = drillIntoField(cursor, pathPart); err != nil {
 				e := failedToResolveRefFragmentPart(ref, pathPart)
-				return nil, fmt.Errorf("%s: %s", e.Error(), err.Error())
+				return nil, fmt.Errorf("%s: %w", e, err)
 			}
 			if cursor == nil {
 				return nil, failedToResolveRefFragmentPart(ref, pathPart)
@@ -430,11 +432,11 @@ func (loader *Loader) resolveRef(doc *T, ref string, path *url.URL) (*T, string,
 
 	var resolvedPath *url.URL
 	if resolvedPath, err = resolvePath(path, parsedURL); err != nil {
-		return nil, "", nil, fmt.Errorf("error resolving path: %v", err)
+		return nil, "", nil, fmt.Errorf("error resolving path: %w", err)
 	}
 
 	if doc, err = loader.loadFromURIInternal(resolvedPath); err != nil {
-		return nil, "", nil, fmt.Errorf("error resolving reference %q: %v", ref, err)
+		return nil, "", nil, fmt.Errorf("error resolving reference %q: %w", ref, err)
 	}
 
 	return doc, "#" + fragment, resolvedPath, nil
@@ -480,7 +482,7 @@ func (loader *Loader) resolveHeaderRef(doc *T, component *HeaderRef, documentPat
 	}
 
 	if schema := value.Schema; schema != nil {
-		if err := loader.resolveSchemaRef(doc, schema, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, schema, documentPath, []string{}); err != nil {
 			return err
 		}
 	}
@@ -532,13 +534,13 @@ func (loader *Loader) resolveParameterRef(doc *T, component *ParameterRef, docum
 	}
 	for _, contentType := range value.Content {
 		if schema := contentType.Schema; schema != nil {
-			if err := loader.resolveSchemaRef(doc, schema, documentPath); err != nil {
+			if err := loader.resolveSchemaRef(doc, schema, documentPath, []string{}); err != nil {
 				return err
 			}
 		}
 	}
 	if schema := value.Schema; schema != nil {
-		if err := loader.resolveSchemaRef(doc, schema, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, schema, documentPath, []string{}); err != nil {
 			return err
 		}
 	}
@@ -592,7 +594,7 @@ func (loader *Loader) resolveRequestBodyRef(doc *T, component *RequestBodyRef, d
 			contentType.Examples[name] = example
 		}
 		if schema := contentType.Schema; schema != nil {
-			if err := loader.resolveSchemaRef(doc, schema, documentPath); err != nil {
+			if err := loader.resolveSchemaRef(doc, schema, documentPath, []string{}); err != nil {
 				return err
 			}
 		}
@@ -656,7 +658,7 @@ func (loader *Loader) resolveResponseRef(doc *T, component *ResponseRef, documen
 			contentType.Examples[name] = example
 		}
 		if schema := contentType.Schema; schema != nil {
-			if err := loader.resolveSchemaRef(doc, schema, documentPath); err != nil {
+			if err := loader.resolveSchemaRef(doc, schema, documentPath, []string{}); err != nil {
 				return err
 			}
 			contentType.Schema = schema
@@ -670,8 +672,12 @@ func (loader *Loader) resolveResponseRef(doc *T, component *ResponseRef, documen
 	return nil
 }
 
-func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPath *url.URL) (err error) {
-	if component != nil && component.Value != nil {
+func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPath *url.URL, visited []string) (err error) {
+	if component == nil {
+		return errors.New("invalid schema: value MUST be an object")
+	}
+
+	if component.Value != nil {
 		if loader.visitedSchema == nil {
 			loader.visitedSchema = make(map[*Schema]struct{})
 		}
@@ -681,9 +687,6 @@ func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPat
 		loader.visitedSchema[component.Value] = struct{}{}
 	}
 
-	if component == nil {
-		return errors.New("invalid schema: value MUST be an object")
-	}
 	ref := component.Ref
 	if ref != "" {
 		if isSingleRefElement(ref) {
@@ -693,12 +696,18 @@ func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPat
 			}
 			component.Value = &schema
 		} else {
+			if visitedLimit(visited, ref, 3) {
+				visited = append(visited, ref)
+				return fmt.Errorf("%s - %s", CircularReferenceError, strings.Join(visited, " -> "))
+			}
+			visited = append(visited, ref)
+
 			var resolved SchemaRef
 			componentPath, err := loader.resolveComponent(doc, ref, documentPath, &resolved)
 			if err != nil {
 				return err
 			}
-			if err := loader.resolveSchemaRef(doc, &resolved, componentPath); err != nil {
+			if err := loader.resolveSchemaRef(doc, &resolved, componentPath, visited); err != nil {
 				return err
 			}
 			component.Value = resolved.Value
@@ -713,37 +722,37 @@ func (loader *Loader) resolveSchemaRef(doc *T, component *SchemaRef, documentPat
 
 	// ResolveRefs referred schemas
 	if v := value.Items; v != nil {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	for _, v := range value.Properties {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	if v := value.AdditionalProperties; v != nil {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	if v := value.Not; v != nil {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	for _, v := range value.AllOf {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	for _, v := range value.AnyOf {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
 	for _, v := range value.OneOf {
-		if err := loader.resolveSchemaRef(doc, v, documentPath); err != nil {
+		if err := loader.resolveSchemaRef(doc, v, documentPath, visited); err != nil {
 			return err
 		}
 	}
@@ -1045,4 +1054,17 @@ func (loader *Loader) resolvePathItemRefContinued(doc *T, pathItem *PathItem, do
 
 func unescapeRefString(ref string) string {
 	return strings.Replace(strings.Replace(ref, "~1", "/", -1), "~0", "~", -1)
+}
+
+func visitedLimit(visited []string, ref string, limit int) bool {
+	visitedCount := 0
+	for _, v := range visited {
+		if v == ref {
+			visitedCount++
+			if visitedCount >= limit {
+				return true
+			}
+		}
+	}
+	return false
 }
